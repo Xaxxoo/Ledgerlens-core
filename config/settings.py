@@ -23,6 +23,20 @@ class Settings:
     trade_history_lookback_days: int = field(default_factory=lambda: int(os.getenv("TRADE_HISTORY_LOOKBACK_DAYS", "30")))
 
     benford_mad_threshold: float = field(default_factory=lambda: float(os.getenv("BENFORD_MAD_THRESHOLD", "0.015")))
+    # Adaptive Benford window sizing (Issue-102)
+    # Minimum trade count required for a statistically valid chi-square test.
+    BENFORD_MIN_SAMPLE_COUNT: int = field(
+        default_factory=lambda: int(os.getenv("BENFORD_MIN_SAMPLE_COUNT", "30"))
+    )
+    # Maximum window width (days) the adaptive expander is allowed to reach.
+    # Hard-capped at 365 to prevent loading excessive history.
+    BENFORD_MAX_WINDOW_DAYS: int = field(
+        default_factory=lambda: int(os.getenv("BENFORD_MAX_WINDOW_DAYS", "90"))
+    )
+    # Multiplier applied per expansion step (doubling by default).
+    BENFORD_EXPANSION_FACTOR: float = field(
+        default_factory=lambda: float(os.getenv("BENFORD_EXPANSION_FACTOR", "2.0"))
+    )
     _default_risk_score_threshold: int = field(default_factory=lambda: int(os.getenv("RISK_SCORE_THRESHOLD", "70")))
     COMMITTEE_QUORUM: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_QUORUM", "3")))
     COMMITTEE_VOTE_DEADLINE_DAYS: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_VOTE_DEADLINE_DAYS", "14")))
