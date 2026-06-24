@@ -10,13 +10,25 @@ each individual pair close to Benford while the *joint* cross-pair behaviour is
 statistically impossible under independent trading. The multivariate helpers
 (`joint_digit_matrix`, `benford_copula_statistic`, `cross_pair_sync_score`,
 `multivariate_benford_score`) surface that coordination signal.
+
+Adaptive window sizing (``AdaptiveBenfordWindow``) ensures that Benford metrics
+are only computed when the sample count N >= ``BENFORD_MIN_SAMPLE_COUNT``. When
+a target window contains fewer trades, the window is doubled up to
+``BENFORD_MAX_WINDOW_DAYS``. If expansion still cannot reach the minimum, the
+result is marked ``valid=False`` so downstream consumers can handle
+statistically unreliable windows gracefully.
 """
 
+import bisect
+import logging
 import math
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 from scipy.stats import chi2, norm
+
+logger = logging.getLogger(__name__)
 
 DIGITS = list(range(1, 10))
 
@@ -343,3 +355,282 @@ def multivariate_benford_score(
         "digit_entropy_delta": digit_entropy_delta(matrix),
         "pairs": pairs,
     }
+
+
+# ---------------------------------------------------------------------------
+# Adaptive window sizing
+#
+# The chi-square test over 9 digit bins requires expected cell counts >= 5,
+# which demands N >= ~30 trades. For sparse wallets or quiet periods the fixed
+# rolling windows (1h, 4h, 24h, 7d, 30d) may have too few samples.
+# AdaptiveBenfordWindow doubles the window until N >= MIN_SAMPLE_COUNT or the
+# maximum window width is reached, keeping statistics valid.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BenfordWindowResult:
+    """Result of an adaptive Benford window computation for one target window.
+
+    Attributes:
+        label: The target window label (e.g. ``"1h"``).
+        amounts: Trade amounts sliced from the (possibly expanded) window.
+        effective_seconds: Actual window width used (>= target when expanded).
+        valid: ``True`` when ``len(amounts) >= min_sample_count``.
+        expanded: ``True`` when the window was widened beyond the target.
+        merged: ``True`` when two adjacent windows were merged as a fallback.
+        merged_windows: Labels of the constituent windows when ``merged=True``.
+        reason: Human-readable explanation when ``valid=False``.
+    """
+
+    label: str
+    amounts: list[float]
+    effective_seconds: int
+    valid: bool
+    expanded: bool = False
+    merged: bool = False
+    merged_windows: list[str] = field(default_factory=list)
+    reason: str = ""
+
+
+class AdaptiveBenfordWindow:
+    """Adaptive rolling-window sampler for Benford's Law analysis.
+
+    Guarantees that every returned ``BenfordWindowResult`` either contains at
+    least ``min_sample_count`` trades (``valid=True``) or is explicitly marked
+    ``valid=False`` — never silently returning unreliable statistics.
+
+    Algorithm (per target window):
+    1. Try the target window as-is.
+    2. If N < ``min_sample_count``, double the window up to ``max_window_days``.
+    3. If still N < ``min_sample_count``, return ``valid=False``.
+    4. As a post-pass, merge the two smallest invalid windows if that reaches N.
+
+    Trade timestamps are pre-sorted once; individual window slices use
+    ``bisect`` for O(log N) boundary lookups.
+
+    Args:
+        min_sample_count: Minimum trades for a statistically valid chi-square.
+        max_window_days: Hard upper bound on expansion (security: prevents
+            loading unbounded history and exhausting memory).
+        expansion_factor: Multiplier applied per expansion step (default 2.0).
+    """
+
+    def __init__(
+        self,
+        min_sample_count: int = 30,
+        max_window_days: int = 90,
+        expansion_factor: float = 2.0,
+    ) -> None:
+        if max_window_days > 365:
+            raise ValueError("max_window_days must not exceed 365 to prevent memory exhaustion")
+        self.min_sample_count = min_sample_count
+        self.max_window_days = max_window_days
+        self.expansion_factor = expansion_factor
+
+    @staticmethod
+    def _prepare_sorted_arrays(trades: list[dict]) -> tuple[list[float], list[float]]:
+        """Sort trades by timestamp and pre-filter to only valid amounts.
+
+        Returns two parallel lists: sorted timestamps and corresponding
+        positive-finite amounts.  Pre-filtering here means per-window slices
+        need no further validation, reducing inner-loop cost from O(slice)
+        to O(1).
+        """
+        valid_pairs = sorted(
+            (t["timestamp"], t["amount"])
+            for t in trades
+            if t.get("amount") is not None
+            and math.isfinite(t["amount"])
+            and t["amount"] > 0
+        )
+        sorted_timestamps_arr = [p[0] for p in valid_pairs]
+        sorted_amounts_arr = [p[1] for p in valid_pairs]
+        return sorted_timestamps_arr, sorted_amounts_arr
+
+    def fit(
+        self,
+        trades: list[dict],
+        target_window_label: str,
+        target_window_seconds: int,
+        as_of_ts: float,
+    ) -> BenfordWindowResult:
+        """Compute a Benford window result for one target window.
+
+        Args:
+            trades: List of trade dicts with ``timestamp`` (Unix epoch float)
+                and ``amount`` (positive float) keys.
+            target_window_label: Human-readable label (e.g. ``"1h"``).
+            target_window_seconds: Width of the target window in seconds.
+            as_of_ts: Reference Unix epoch timestamp (right edge of window).
+
+        Returns:
+            ``BenfordWindowResult`` with amounts and validity flag.
+        """
+        if not trades:
+            return BenfordWindowResult(
+                label=target_window_label,
+                amounts=[],
+                effective_seconds=target_window_seconds,
+                valid=False,
+                reason="no_trades",
+            )
+
+        sorted_timestamps_arr, sorted_amounts_arr = self._prepare_sorted_arrays(trades)
+        return self._fit_presorted(
+            sorted_timestamps_arr,
+            sorted_amounts_arr,
+            target_window_label,
+            target_window_seconds,
+            as_of_ts,
+        )
+
+    def _fit_presorted(
+        self,
+        sorted_timestamps_arr: list[float],
+        sorted_amounts_arr: list[float],
+        target_window_label: str,
+        target_window_seconds: int,
+        as_of_ts: float,
+    ) -> BenfordWindowResult:
+        """Inner loop operating on pre-sorted, pre-filtered parallel arrays.
+
+        Called by both ``fit`` (which sorts and filters on entry) and
+        ``fit_all`` (which sorts and filters once for all windows).
+
+        Callers must guarantee:
+        - ``sorted_timestamps_arr`` and ``sorted_amounts_arr`` are sorted by
+          timestamp ascending and have the same length.
+        - All amounts are positive and finite (pre-filtered by
+          ``_prepare_sorted_arrays``).
+        """
+        max_seconds = int(self.max_window_days * 86400)
+        max_iterations = (
+            int(math.ceil(math.log2(max_seconds / max(target_window_seconds, 1)))) + 1
+            if max_seconds > target_window_seconds
+            else 1
+        )
+
+        width = target_window_seconds
+        expanded = False
+        valid_amounts: list[float] = []
+
+        for _ in range(max_iterations + 1):
+            width = min(width, max_seconds)
+            cutoff = as_of_ts - width
+            left_idx = bisect.bisect_right(sorted_timestamps_arr, cutoff)
+            # All amounts are pre-filtered; the slice is the valid set.
+            valid_amounts = sorted_amounts_arr[left_idx:]
+            if len(valid_amounts) >= self.min_sample_count:
+                if width == target_window_seconds:
+                    logger.debug(
+                        "Benford window %s: N=%d >= %d (no expansion needed)",
+                        target_window_label,
+                        len(valid_amounts),
+                        self.min_sample_count,
+                    )
+                else:
+                    orig_idx = bisect.bisect_right(
+                        sorted_timestamps_arr, as_of_ts - target_window_seconds
+                    )
+                    orig_n = len(sorted_amounts_arr) - orig_idx
+                    logger.warning(
+                        "Benford window %s expanded: original_N=%d -> final_N=%d, "
+                        "effective_width_hours=%.1f",
+                        target_window_label,
+                        orig_n,
+                        len(valid_amounts),
+                        width / 3600,
+                    )
+                return BenfordWindowResult(
+                    label=target_window_label,
+                    amounts=list(valid_amounts),
+                    effective_seconds=width,
+                    valid=True,
+                    expanded=expanded,
+                )
+            if width >= max_seconds:
+                break
+            width = int(min(width * self.expansion_factor, max_seconds))
+            expanded = True
+
+        logger.error(
+            "Benford window %s: insufficient data even at max_width=%dd (N=%d < %d)",
+            target_window_label,
+            self.max_window_days,
+            len(valid_amounts),
+            self.min_sample_count,
+        )
+        return BenfordWindowResult(
+            label=target_window_label,
+            amounts=list(valid_amounts),
+            effective_seconds=width,
+            valid=False,
+            reason="insufficient_even_after_expansion",
+            expanded=expanded,
+        )
+
+    def fit_all(
+        self,
+        trades: list[dict],
+        windows: dict[str, int],
+        as_of_ts: float,
+    ) -> dict[str, BenfordWindowResult]:
+        """Compute adaptive Benford windows for all target windows.
+
+        Trades are sorted and filtered once; each window uses ``bisect`` for
+        O(log N) boundary lookups, giving O(N log N + W log N) total
+        complexity where W is the number of windows.
+
+        Args:
+            trades: List of trade dicts (``timestamp``, ``amount``).
+            windows: Mapping of label -> seconds for each target window.
+            as_of_ts: Right-edge timestamp.
+
+        Returns:
+            Dict mapping window label -> ``BenfordWindowResult``.
+
+        After individual fits, attempts one merge pass: if two of the smallest
+        invalid windows can be combined to reach ``min_sample_count``, they are
+        merged and marked ``merged=True``.
+        """
+        if not trades:
+            return {
+                label: BenfordWindowResult(
+                    label=label,
+                    amounts=[],
+                    effective_seconds=secs,
+                    valid=False,
+                    reason="no_trades",
+                )
+                for label, secs in windows.items()
+            }
+
+        # Sort and filter once; all window calls reuse the pre-filtered arrays.
+        sorted_timestamps_arr, sorted_amounts_arr = self._prepare_sorted_arrays(trades)
+
+        results = {
+            label: self._fit_presorted(
+                sorted_timestamps_arr, sorted_amounts_arr, label, secs, as_of_ts
+            )
+            for label, secs in windows.items()
+        }
+
+        # Merge pass: find smallest two invalid windows
+        invalid = [(label, r) for label, r in results.items() if not r.valid]
+        if len(invalid) >= 2:
+            invalid_sorted = sorted(invalid, key=lambda x: x[1].effective_seconds)
+            label_a, res_a = invalid_sorted[0]
+            label_b, res_b = invalid_sorted[1]
+            merged_amounts = res_a.amounts + res_b.amounts
+            if len(merged_amounts) >= self.min_sample_count:
+                merged = BenfordWindowResult(
+                    label=label_a,
+                    amounts=merged_amounts,
+                    effective_seconds=max(res_a.effective_seconds, res_b.effective_seconds),
+                    valid=True,
+                    merged=True,
+                    merged_windows=[label_a, label_b],
+                )
+                results[label_a] = merged
+        return results

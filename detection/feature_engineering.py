@@ -118,6 +118,13 @@ MULTIVARIATE_BENFORD_FEATURE_NAMES = [
     "digit_entropy_delta",
 ]
 
+# Boolean flag features indicating whether adaptive Benford window expansion
+# was triggered for each rolling window (Issue-102). A value of 1.0 means the
+# target window contained fewer than BENFORD_MIN_SAMPLE_COUNT trades.
+BENFORD_ADAPTIVE_FEATURE_NAMES = [
+    f"benford_window_expanded_{w}" for w in ("1h", "4h", "24h", "7d", "30d")
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -148,6 +155,9 @@ FEATURE_NAMES = FEATURE_NAMES + CROSS_CHAIN_FEATURE_NAMES  # type: ignore[assign
 # Multivariate-Benford and causal (PDC) features are appended after
 # cross-chain features for the same checkpoint-compatibility reason.
 FEATURE_NAMES = FEATURE_NAMES + MULTIVARIATE_BENFORD_FEATURE_NAMES + CAUSAL_FEATURE_NAMES  # type: ignore[assignment]
+
+# Adaptive Benford window expansion flags are appended last (Issue-102).
+FEATURE_NAMES = FEATURE_NAMES + BENFORD_ADAPTIVE_FEATURE_NAMES  # type: ignore[assignment]
 
 
 def _window_slice(trades: pd.DataFrame, as_of: pd.Timestamp, window: pd.Timedelta) -> pd.DataFrame:
@@ -598,55 +608,6 @@ def sandwich_features(
     }
 
 
-def causal_features(
-    trades: pd.DataFrame,
-    account: str,
-    prices: pd.DataFrame | None = None,
-    pair: str | None = None,
-) -> dict:
-    zero = {name: 0.0 for name in CAUSAL_FEATURE_NAMES}
-    if prices is None or getattr(prices, "empty", True) or trades.empty:
-        return zero
-
-    return {
-        "pdc_5m": float(estimate_pdc(trades, prices, account, pair, window_minutes=5)),
-        "pdc_1h": float(estimate_pdc(trades, prices, account, pair, window_minutes=60)),
-    }
-
-
-def multivariate_benford_features(
-    account: str,
-    trades_by_pair: dict[str, pd.DataFrame] | None,
-) -> dict:
-    default = {
-        "benford_copula_pval": 1.0,
-        "cross_pair_sync_ratio": 0.0,
-        "digit_entropy_delta": 0.0,
-    }
-    if not trades_by_pair:
-        return default
-
-    frames = []
-    active_pairs = []
-    for pair, df in trades_by_pair.items():
-        if df is not None and not df.empty:
-            frames.append(df)
-            active_pairs.append(pair)
-    if len(frames) < 2:
-        return default
-
-    from detection.benford_engine import multivariate_benford_score
-
-    all_trades = pd.concat(frames, ignore_index=True)
-    wallet_pairs = [(account, p) for p in active_pairs]
-    result = multivariate_benford_score(all_trades, wallet_pairs)
-    return {
-        "benford_copula_pval": result["copula_pval"],
-        "cross_pair_sync_ratio": result["sync_ratio"],
-        "digit_entropy_delta": result["digit_entropy_delta"],
-    }
-
-
 def build_cross_chain_features(
     wallet: str,
     linker: "CrossChainLinker",  # noqa: F821
@@ -703,6 +664,8 @@ def multivariate_benford_features(account: str, trades_by_pair: dict[str, pd.Dat
     `detection.benford_engine.multivariate_benford_score`). Omitting it (or
     passing fewer than 2 pairs) yields the i.i.d.-Benford defaults.
     """
+    from detection.benford_engine import multivariate_benford_score
+
     zero = {name: (1.0 if name == "benford_copula_pval" else 0.0) for name in MULTIVARIATE_BENFORD_FEATURE_NAMES}
     if not trades_by_pair or len(trades_by_pair) < 2:
         return zero
