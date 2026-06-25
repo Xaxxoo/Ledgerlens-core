@@ -10,6 +10,7 @@ to compute conformal prediction thresholds via ``ConformalCalibrator``.
 """
 
 import joblib
+import logging
 import mlflow
 import numpy as np
 import pandas as pd
@@ -23,6 +24,8 @@ from xgboost import XGBClassifier
 
 from config.settings import settings
 from detection.feature_engineering import FEATURE_NAMES
+
+logger = logging.getLogger("ledgerlens.model_training")
 
 
 def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -40,6 +43,7 @@ def _train_ensemble_base(
     adversarial_augment: bool = True,
     calibrate: bool = True,
     adversarial_hardening: bool = False,
+    causal_feature_selection: bool = False,
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -57,7 +61,6 @@ def _train_ensemble_base(
     ``ConformalCalibrator`` instances are returned under the ``"calib"`` key
     and used by ``save_models`` to persist the artifacts.
     """
-    df = merge_evasion_samples(df, evasion_samples)
     if adversarial_augment:
         from detection.dataset import build_training_dataset
         from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
@@ -101,6 +104,31 @@ def _train_ensemble_base(
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=random_state, stratify=y
         )
+
+    # --- Causal feature selection (PC skeleton phase)
+    _causal_selected_features = None
+    if causal_feature_selection:
+        from detection.causal_engine import CausalFeatureSelector
+
+        selector = CausalFeatureSelector(
+            alpha=settings.causal_independence_alpha,
+            max_conditioning_size=settings.causal_max_conditioning_size,
+        )
+        selected = selector.fit(
+            X_train.to_numpy(dtype=float),
+            y_train.to_numpy(dtype=float),
+            feature_names=list(X_train.columns),
+        )
+        if selected:
+            X_train = X_train[selected]
+            X_test = X_test[selected]
+            if calibrate and "X_cal" in cal_split_info:
+                cal_split_info["X_cal"] = cal_split_info["X_cal"][selected]
+            _causal_selected_features = selected
+            logger.info(
+                "Causal feature selection retained %d/%d features",
+                len(selected), X_train.shape[1] + (len(list(X_train.columns)) - len(selected)),
+            )
 
     smote = SMOTE(random_state=random_state)
     X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
@@ -236,9 +264,10 @@ def _train_ensemble_base(
             "f1": lstm_f1,
         }
     except Exception as e:
-        import logging
-        logger = logging.getLogger("ledgerlens.model_training")
         logger.exception("Failed to train temporal LSTM model: %s", e)
+
+    if _causal_selected_features is not None:
+        results["_causal_selected_features"] = _causal_selected_features
 
     return results
 
@@ -276,7 +305,7 @@ def save_models(
 
     signing_key = settings.model_signing_key.encode()
     for name, result in results.items():
-        if name == "_calib":
+        if name in ("_calib", "_causal_selected_features"):
             continue
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
@@ -299,12 +328,15 @@ def save_models(
 
     version = _compute_version_hash(training_row_count, column_hash)
 
+    _causal_selected = results.get("_causal_selected_features")
     metadata = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": version,
         "training_dataset_path": training_dataset_path or "",
         "training_row_count": training_row_count,
         "column_hash": column_hash,
+        "causal_feature_selection": _causal_selected is not None,
+        "causal_selected_features": _causal_selected or [],
         "model_metrics": {
             name: {
                 "auc_roc": result.get("auc_roc", 0.0),
@@ -312,7 +344,7 @@ def save_models(
                 "f1": result.get("f1", 0.0),
             }
             for name, result in results.items()
-            if name != "_calib"
+            if name not in ("_calib", "_causal_selected_features")
         },
     }
 
@@ -320,9 +352,6 @@ def save_models(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    import logging
-
-    logger = logging.getLogger("ledgerlens.model_training")
     logger.info("Wrote training metadata to %s", metadata_path)
 
     # ------------------------------------------------------------------
@@ -399,7 +428,7 @@ if __name__ == "__main__":
 
 
 from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG  # noqa: E402
-from detection.mlflow_tracker import (
+from detection.mlflow_tracker import (  # noqa: E402
     log_metrics,
     log_training_dataset_metadata,
     mlflow_run,
@@ -413,6 +442,7 @@ def train_ensemble(
     *args,
     use_gnn: bool = False,
     model_dir: str = "models",
+    causal_feature_selection: bool = False,
     experiment_name: str | None = None,
     tracking_uri: str | None = None,
     **kwargs,
@@ -428,6 +458,10 @@ def train_ensemble(
         use_gnn: If True, trains a T-GNN on the training graph, appends its
             two output features to the feature matrix before SMOTE, and
             saves the checkpoint as gnn_model.pt in model_dir.
+        causal_feature_selection: When True, runs the PC-skeleton causal
+            feature selector before SMOTE resampling.  Selected features are
+            stored in ``results["_causal_selected_features"]`` and written to
+            ``training_metadata.json`` by :func:`save_models`.
         experiment_name: MLflow experiment name.  Falls back to
             ``settings.mlflow_experiment_name`` then ``"ledgerlens-training"``.
         tracking_uri: MLflow tracking URI.  Falls back to
@@ -459,7 +493,7 @@ def train_ensemble(
 
         results = _train_ensemble_base(
             df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
-            model_dir=model_dir, **kwargs
+            model_dir=model_dir, causal_feature_selection=causal_feature_selection, **kwargs
         )
 
         if run_id:

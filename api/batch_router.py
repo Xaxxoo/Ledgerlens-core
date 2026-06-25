@@ -11,7 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from detection.storage import get_latest_scores, init_db
+from detection.storage import get_latest_scores
 
 router = APIRouter(prefix="/scores", tags=["batch"])
 

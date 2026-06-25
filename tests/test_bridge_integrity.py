@@ -10,13 +10,10 @@ Covers:
   - Edge cases: empty logs list, receipt call exception
 """
 
-import json
 import time
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
-import responses as responses_lib
 from stellar_sdk import Keypair
 
 from ingestion.bridge_loader import (

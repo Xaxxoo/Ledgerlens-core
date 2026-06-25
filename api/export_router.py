@@ -13,7 +13,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from api.auth import require_admin_key
-from config.settings import settings
 from detection.storage import _connect
 
 router = APIRouter(prefix="/export", tags=["export"])

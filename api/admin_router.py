@@ -1,6 +1,5 @@
 """Admin REST API for model lifecycle and system configuration (Issue #160)."""
 
-import glob
 import os
 import sqlite3
 import uuid
