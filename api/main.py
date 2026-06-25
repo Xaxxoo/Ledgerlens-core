@@ -28,8 +28,6 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from fastapi.routing import APIRouter
-from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key

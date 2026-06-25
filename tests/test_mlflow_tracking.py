@@ -4,7 +4,6 @@ Verifies that ``train_ensemble`` creates an MLflow run with the correct
 parameter keys, metric keys, and model artifacts.
 """
 
-import json
 import os
 
 import mlflow
