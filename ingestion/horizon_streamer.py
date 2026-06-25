@@ -2,14 +2,22 @@
 
 Streams the `/trades` endpoint and yields `Trade` objects as ledgers close.
 Downstream, `run_pipeline.py` feeds these into `detection.feature_engineering`.
+
+A :class:`detection.streaming_features.StreamingFeatureEngine` instance can be
+optionally wired in via :func:`stream_with_features` to produce sub-second
+feature vectors alongside each trade event.
 """
 
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import sseclient
 
 from config.settings import settings
 from ingestion.data_models import Asset, Trade, TradeType
+
+if TYPE_CHECKING:
+    from detection.streaming_features import FeatureVector, StreamingFeatureEngine
 
 
 def _parse_trade(record: dict) -> Trade:
@@ -88,6 +96,38 @@ def _decode_event(data: str) -> dict | None:
         return json.loads(data)
     except json.JSONDecodeError:
         return None
+
+
+def stream_with_features(
+    engine: "StreamingFeatureEngine",
+    cursor: str = "now",
+) -> "Iterator[tuple[Trade, FeatureVector]]":
+    """Yield ``(Trade, FeatureVector)`` pairs with sub-second latency.
+
+    Each incoming SSE trade is fed into *engine* via
+    :meth:`~detection.streaming_features.StreamingFeatureEngine.update` which
+    returns the updated feature vector for ``trade.base_account`` in O(1).
+    Downstream consumers can call a lightweight model against the feature
+    vector without triggering a full pipeline recompute.
+
+    Parameters
+    ----------
+    engine:
+        A :class:`~detection.streaming_features.StreamingFeatureEngine`
+        instance, typically shared across the lifetime of the stream.
+    cursor:
+        Horizon paging token, or ``"now"`` for the live tip.
+
+    Yields
+    ------
+    tuple[Trade, FeatureVector]
+        The parsed trade and its wallet's current feature vector.  The vector
+        always contains ``"stream_latency_ms"`` measuring the wall-clock time
+        from the SSE event decode to the feature-vector return.
+    """
+    for trade in stream_trades(cursor):
+        feature_vector = engine.update(trade)
+        yield trade, feature_vector
 
 
 if __name__ == "__main__":
