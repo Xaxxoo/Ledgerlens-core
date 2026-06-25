@@ -398,7 +398,7 @@ if __name__ == "__main__":
 
 
 from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG  # noqa: E402
-from detection.mlflow_tracker import (
+from detection.mlflow_tracker import (  # noqa: E402
     log_metrics,
     log_training_dataset_metadata,
     mlflow_run,

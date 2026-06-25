@@ -80,7 +80,7 @@ def test_compute_dataset_hash_changes_with_data():
 
 def test_train_ensemble_creates_mlflow_run(tmp_mlruns, mini_dataset):
     """``train_ensemble`` creates an MLflow run with correct parameter and metric keys."""
-    results = train_ensemble(
+    train_ensemble(
         mini_dataset,
         calibrate=False,
         adversarial_augment=False,

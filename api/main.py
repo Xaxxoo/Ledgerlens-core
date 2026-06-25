@@ -28,12 +28,14 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.routing import APIRouter
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
+from api.namespace import list_namespaces
 from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
@@ -143,6 +145,9 @@ class DisputeCreate(BaseModel):
 class VoteBody(BaseModel):
     voter_key_hash: str
     vote: str
+
+
+v1_router = APIRouter(prefix="/v1")
 
 
 @v1_router.get("/health")
