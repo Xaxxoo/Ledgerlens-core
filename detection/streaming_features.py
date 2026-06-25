@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
